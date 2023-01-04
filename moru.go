@@ -1,10 +1,12 @@
 // Package moru provides functions to run the models created by [goMortgage].
 //
-// Using moru is quite straightforward:
+// Using moru is quite straightforward. The user provides
 //
-//   - The user provides a ClickHouse table that has the features required by the model.
+//   - A ClickHouse table that has the features required by the model.
+//
 //   - A pointer to the directory of the model created by goMortgage.
-//   - The input table, augmented by the model outputs, is saved back to ClickHouse.
+//
+// The input table, augmented by the model outputs, is saved back to ClickHouse.
 //
 // [goMortgage]: https://pkg.go.dev/github.com/invertedv/goMortgage
 package moru
@@ -44,8 +46,10 @@ const (
 // regression, use the first example as a template (i.e. column 0 is the output).
 type ModelMap map[string][]int
 
-func init() {
-	sea.Verbose = false
+// ModelDef defines a model and the fields to calculate from it.
+type ModelDef struct {
+	Location string   // directory with the goMortgage model
+	Fields   ModelMap // map of fields names to columns of model output
 }
 
 // addModel adds the output of an addModel model to basePipe. This expects 4 files in modelRoot:
@@ -129,7 +133,7 @@ func addModel(modelRoot string, basePipe sea.Pipeline) error {
 }
 
 // addAllModels runs through all the models in the inputModels directory.
-func addAllModels(rootDir string, basePipe sea.Pipeline, modl ModelMap) error {
+func addAllModels(rootDir string, basePipe sea.Pipeline, fts sea.FTypes, obsFt *sea.FType, modl ModelMap) error {
 	rootDir = slash(rootDir)
 	entries, e := os.ReadDir(rootDir)
 	if e != nil {
@@ -142,24 +146,14 @@ func addAllModels(rootDir string, basePipe sea.Pipeline, modl ModelMap) error {
 			continue
 		}
 
-		if e := addModel(rootDir+dir.Name(), basePipe); e != nil {
-			return e
+		if e1 := addModel(rootDir+dir.Name(), basePipe); e1 != nil {
+			return e1
 		}
-	}
-
-	modSpec, e := sea.LoadModSpec(rootDir + "modelS.nn")
-	if e != nil {
-		return e
-	}
-	var obsFt *sea.FType = nil
-
-	if trg := modSpec.TargetName(); trg != "" {
-		obsFt = basePipe.GetFType(trg)
 	}
 
 	for fieldName, targets := range modl {
 		// AddFitted will use fts in place of whatever we have in basePipe fts
-		if e := sea.AddFitted(basePipe, rootDir+"model", targets, fieldName, basePipe.GetFTypes(), false, obsFt); e != nil {
+		if e := sea.AddFitted(basePipe, rootDir+"model", targets, fieldName, fts, false, obsFt); e != nil {
 			return e
 		}
 	}
@@ -168,37 +162,74 @@ func addAllModels(rootDir string, basePipe sea.Pipeline, modl ModelMap) error {
 }
 
 // NewPipe creates a new data pipeline.
-//   - table: name of the ClickHouse table wiwith data to calculate model
-//   - modelLoc: directory with the model
+//   - table: name of the ClickHouse table with data to calculate model
+//   - orderBy: comma-separated field list that produces a unique key
+//   - models: model location and fields to create
 //   - startRow: first row of table to pull for the pipeline
 //   - batchSize: number of rows of table to pull
-//   - modl: ModelMap of columns of model output to field name in pipeline
 //   - conn: connector to ClickHouse
-func NewPipe(table, modelLoc string, startRow, batchSize int, modl ModelMap, conn *chutils.Connect) (sea.Pipeline, error) {
-	qry := fmt.Sprintf("SELECT *, toInt32(rowNumberInAllBlocks()) as rn FROM %s WHERE rn >= %d AND rn < %d ", table, startRow, startRow+batchSize)
+func NewPipe(table, orderBy string, models []ModelDef, startRow, batchSize int, conn *chutils.Connect) (sea.Pipeline, error) {
+	with := fmt.Sprintf("WITH d AS (SELECT * FROM %s ORDER BY %s)", table, orderBy)
+	qry := fmt.Sprintf("%s SELECT *, 'N' AS aoBap, toInt32(rowNumberInAllBlocks()) AS rn FROM d WHERE rn >= %d AND rn < %d ",
+		with, startRow, startRow+batchSize)
+
 	rdr := s.NewReader(qry, conn)
 
 	if e := rdr.Init("", chutils.MergeTree); e != nil {
 		return nil, e
 	}
 
-	fts, e := sea.LoadFTypes(slash(modelLoc) + "fieldDefs.jsn")
-	if e != nil {
-		return nil, e
+	// fts is all the fields in either model that are categorical.  This is to force pipe.Init to treat them as such.
+	// We don't specify the levels, this way we'll get a granular map of all the values in the data so that the
+	// application of the maps of each model will be correct.
+	var fts sea.FTypes
+
+	// values by model: features and targets
+	ftMods := make([]sea.FTypes, len(models))
+	obsFts := make([]*sea.FType, len(models))
+
+	for ind, modl := range models {
+		loc := slash(modl.Location)
+		modSpec, e := sea.LoadModSpec(loc + "modelS.nn")
+		if e != nil {
+			return nil, e
+		}
+
+		ftModl, e := sea.LoadFTypes(loc + "fieldDefs.jsn")
+		if e != nil {
+			return nil, e
+		}
+		for _, ft := range ftModl {
+			if ft.Name == modSpec.TargetName() || ft.Name+"Oh" == modSpec.TargetName() {
+				// target
+				obsFts[ind] = ft
+			} else {
+				// features
+				ftMods[ind] = append(ftMods[ind], ft)
+				if ft.Role != sea.FRCts && fts.Get(ft.Name) == nil {
+					ftNew := &sea.FType{
+						Name: ft.Name,
+						Role: ft.Role,
+					}
+					fts = append(fts, ftNew)
+				}
+			}
+		}
 	}
 
 	pipe := sea.NewChData("model run")
-
-	sea.WithFtypes(fts)(pipe)
 	sea.WithReader(rdr)(pipe)
-
+	sea.WithBatchSize(0)(pipe)
+	sea.WithFtypes(fts)(pipe)
 	if e := pipe.Init(); e != nil {
 		return nil, e
 	}
-	sea.WithBatchSize(batchSize)(pipe)
 
-	if e := addAllModels(modelLoc, pipe, modl); e != nil {
-		return nil, e
+	// add the models.
+	for ind, modl := range models {
+		if e := addAllModels(modl.Location, pipe, ftMods[ind], obsFts[ind], modl.Fields); e != nil {
+			return nil, e
+		}
 	}
 
 	return pipe, nil
@@ -207,11 +238,13 @@ func NewPipe(table, modelLoc string, startRow, batchSize int, modl ModelMap, con
 // MakeTable makes ClickHouse table tableName based on the fields in pipe. MakeTable overwrites the table if it
 // exists.
 //   - tableName: name of ClickHouse table to create
+//   - orderBy: comma-separated values of sourceTable that create a unique key
 //   - pipe: Pipeline containing fields to create for the table
 //   - conn: connector to ClickHouse
-func MakeTable(tableName string, pipe sea.Pipeline, conn *chutils.Connect) error {
+func MakeTable(tableName, orderBy string, pipe sea.Pipeline, conn *chutils.Connect) error {
 	gd := pipe.GData()
 	tb := gd.TableSpec()
+	tb.Key = orderBy
 
 	if e := tb.Create(conn, tableName); e != nil {
 		return e
@@ -220,7 +253,7 @@ func MakeTable(tableName string, pipe sea.Pipeline, conn *chutils.Connect) error
 	return nil
 }
 
-// InsertTable inserts the data in pipe into the ClickHouse table tableName.
+// InsertTable inserts the data in pipe into the ClickHouse table tableName. The table must already exist.
 //   - tableName: name of table to insert into (table must exist)
 //   - pipe: pipeline with data to insert
 //   - conn: ClickHouse connector
@@ -248,33 +281,33 @@ func Rows(tableName string, conn *chutils.Connect) int {
 	defer func() { _ = res.Close() }()
 
 	var rows int
-	for res.Next() {
-		if e := res.Scan(&rows); e != nil {
-			return 0
-		}
-
-		break
+	res.Next()
+	if e := res.Scan(&rows); e != nil {
+		return 0
 	}
 
 	return rows
 }
 
-// Score creates destTable from sourceTable adding fitted values from a model
+// Score creates destTable from sourceTable adding fitted values from one or more models.
 //   - sourceTable: source ClickHouse table with features required by the model
 //   - destTable: created ClickHouse table with sourceTable fields plus model outputs
-//   - modelLoc: directory with the model
-//   - modls: mapping of model columns to fields to create in destTable
+//   - orderBy: comma-separated values of sourceTable that create a unique key
+//   - models: model specifications (location, field names and columns)
 //   - batchsize: number of rows to process as a group
 //   - nWorker: number of concurrent processes
-func Score(sourceTable, destTable, modelLoc string, modls ModelMap, batchSize, nWorker int, conn *chutils.Connect) error {
+//   - conn: ClickHouse connector
+//
+// Set 	sea.Verbose = false to suppress messages during run.
+func Score(sourceTable, destTable, orderBy string, models []ModelDef, batchSize, nWorker int, conn *chutils.Connect) error {
 	var pipe sea.Pipeline
 	var e error
 
-	if pipe, e = NewPipe(sourceTable, modelLoc, 0, 1, modls, conn); e != nil {
+	if pipe, e = NewPipe(sourceTable, orderBy, models, 1, batchSize, conn); e != nil {
 		return e
 	}
 
-	if ex := MakeTable(destTable, pipe, conn); ex != nil {
+	if ex := MakeTable(destTable, orderBy, pipe, conn); ex != nil {
 		return ex
 	}
 
@@ -292,7 +325,7 @@ func Score(sourceTable, destTable, modelLoc string, modls ModelMap, batchSize, n
 		queueLen++
 	}
 
-	if queueLen > nWorker {
+	if queueLen < nWorker {
 		nWorker = queueLen
 	}
 
@@ -301,7 +334,7 @@ func Score(sourceTable, destTable, modelLoc string, modls ModelMap, batchSize, n
 	running := 0
 	for ind := 0; ind < queueLen; ind++ {
 		startRow := ind * batchSize
-		if pipe, e = NewPipe(sourceTable, modelLoc, startRow, batchSize, modls, conn); e != nil {
+		if pipe, e = NewPipe(sourceTable, orderBy, models, startRow, batchSize, conn); e != nil {
 			return e
 		}
 		go func() {
