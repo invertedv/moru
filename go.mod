@@ -4,7 +4,7 @@ go 1.19
 
 require (
 	github.com/invertedv/chutils v1.1.13
-	github.com/invertedv/seafan v0.0.31
+	github.com/invertedv/seafan v0.0.32
 )
 
 require (
