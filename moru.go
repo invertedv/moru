@@ -174,7 +174,7 @@ func ScoreToPipe(pipe sea.Pipeline, models []ModelDef, ftMods []sea.FTypes, obsF
 //   - conn: connector to ClickHouse
 func NewPipe(table, orderBy string, models []ModelDef, startRow, batchSize int, conn *chutils.Connect) (sea.Pipeline, error) {
 	with := fmt.Sprintf("WITH d AS (SELECT * FROM %s ORDER BY %s)", table, orderBy)
-	qry := fmt.Sprintf("%s SELECT *, 'N' AS aoBap, toInt32(rowNumberInAllBlocks()) AS rn FROM d WHERE rn >= %d AND rn < %d ",
+	qry := fmt.Sprintf("%s SELECT *, toInt32(rowNumberInAllBlocks()) AS rn FROM d WHERE rn >= %d AND rn < %d ",
 		with, startRow, startRow+batchSize)
 
 	rdr := s.NewReader(qry, conn)
