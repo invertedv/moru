@@ -41,25 +41,23 @@ const (
 	bits32 = 32
 )
 
-// ModelMap maps the outputs of the model to fields in the output table.
-// Examples:
-//
-//   - map["yhat"] = []int{0}
-//
-//     creates a new field "yhat" that is the first column of the model output.
-//
-//   - map["yhat01"] = []int{0,1}
-//
-//     creates a new field "yhat01" that is the sum of the first two columns of the model output.
-//
-// If the model is a
-// regression, use the first example as a template (i.e. column 0 is the output).
-type ModelMap map[string][]int
-
-// ModelDef defines a model and the fields to calculate from it.
+// ModelDef defines a model and the fields to calculate from it.  The models are run in index order.
 type ModelDef struct {
-	Location string   // directory with the goMortgage model
-	Fields   ModelMap // map of fields names to columns of model output
+	Location     string   // directory with the procyonb model
+	FieldNames   []string // slice of field names we're calculating
+	FieldColumns [][]int  // columns to sum corresponding to the field names
+}
+
+func (mdef *ModelDef) Error() error {
+	if mdef.FieldNames == nil || mdef.FieldColumns == nil {
+		return fmt.Errorf("one of ModelDef FieldNames or FieldColumns is nil")
+	}
+
+	if len(mdef.FieldColumns) != len(mdef.FieldNames) {
+		return fmt.Errorf("ModelDef FieldColumns and FieldDefs aren't the same length %v", mdef.FieldNames)
+	}
+
+	return nil
 }
 
 // ScoreToTable creates destTable from sourceTable adding fitted values from one or more models.
@@ -73,17 +71,26 @@ type ModelDef struct {
 //
 // Set 	sea.Verbose = false to suppress messages during run.
 func ScoreToTable(sourceTable, destTable, orderBy string, models []ModelDef, batchSize, nWorker int, conn *chutils.Connect) error {
-	var pipe sea.Pipeline
-	var e error
+	var (
+		pipe sea.Pipeline
+		err  error
+	)
 
-	if pipe, e = NewPipe(sourceTable, orderBy, models, 1, batchSize, conn); e != nil {
-		return e
+	for _, mdef := range models {
+		if e := mdef.Error(); e != nil {
+			return e
+		}
+	}
+
+	if pipe, err = NewPipe(sourceTable, orderBy, models, 1, batchSize, conn); err != nil {
+		return err
 	}
 
 	if ex := MakeTable(destTable, orderBy, pipe, conn); ex != nil {
 		return ex
 	}
 
+	// # of rows in the table
 	rows := Rows(sourceTable, conn)
 	if batchSize == 0 {
 		batchSize = rows
@@ -93,11 +100,13 @@ func ScoreToTable(sourceTable, destTable, orderBy string, models []ModelDef, bat
 		nWorker = runtime.NumCPU()
 	}
 
+	// # of times we have to query the table
 	queueLen := rows / batchSize
 	if rows%batchSize > 0 {
 		queueLen++
 	}
 
+	// check if have more workers than needed
 	if queueLen < nWorker {
 		nWorker = queueLen
 	}
@@ -108,13 +117,20 @@ func ScoreToTable(sourceTable, destTable, orderBy string, models []ModelDef, bat
 	for ind := 0; ind < queueLen; ind++ {
 		startRow := ind * batchSize
 		go func() {
-			if pipe, e = NewPipe(sourceTable, orderBy, models, startRow, batchSize, conn); e != nil {
-				c <- e
+			var (
+				pipeX sea.Pipeline
+				err   error
+			)
+
+			if pipeX, err = NewPipe(sourceTable, orderBy, models, startRow, batchSize, conn); err != nil {
+				c <- err
 				return
 			}
-			c <- InsertTable(destTable, pipe, conn)
+			c <- InsertTable(destTable, pipeX, conn)
 		}()
+
 		running++
+
 		if running == nWorker {
 			e := <-c
 			if e != nil {
@@ -123,6 +139,7 @@ func ScoreToTable(sourceTable, destTable, orderBy string, models []ModelDef, bat
 			running--
 		}
 	}
+
 	// Wait for queue to empty
 	for running > 0 {
 		e := <-c
@@ -153,7 +170,7 @@ func ScoreToPipe(pipe sea.Pipeline, models []ModelDef, ftMods []sea.FTypes, obsF
 	}
 
 	for ind, modl := range models {
-		if e := addAllModels(modl.Location, pipe, ftMods[ind], obsFts[ind], modl.Fields); e != nil {
+		if e := addAllModels(modl.Location, pipe, ftMods[ind], obsFts[ind], modl); e != nil {
 			return e
 		}
 	}
@@ -197,7 +214,7 @@ func NewPipe(table, orderBy string, models []ModelDef, startRow, batchSize int, 
 
 	// add the models.
 	for ind, modl := range models {
-		if e := addAllModels(modl.Location, pipe, ftMods[ind], obsFts[ind], modl.Fields); e != nil {
+		if e := addAllModels(modl.Location, pipe, ftMods[ind], obsFts[ind], modl); e != nil {
 			return nil, e
 		}
 	}
@@ -256,7 +273,7 @@ func GatherFts(models []ModelDef) (ftMods []sea.FTypes, obsFts, cats sea.FTypes,
 }
 
 // addAllModels runs through all the models in the inputModels directory.
-func addAllModels(rootDir string, basePipe sea.Pipeline, fts sea.FTypes, obsFt *sea.FType, modl ModelMap) error {
+func addAllModels(rootDir string, basePipe sea.Pipeline, fts sea.FTypes, obsFt *sea.FType, modl ModelDef) error {
 	rootDir = slash(rootDir)
 	entries, e := os.ReadDir(rootDir)
 	if e != nil {
@@ -274,9 +291,9 @@ func addAllModels(rootDir string, basePipe sea.Pipeline, fts sea.FTypes, obsFt *
 		}
 	}
 
-	for fieldName, targets := range modl {
+	for ind := 0; ind < len(modl.FieldNames); ind++ {
 		// AddFitted will use fts in place of whatever we have in basePipe fts
-		if e := sea.AddFitted(basePipe, rootDir+"model", targets, fieldName, fts, false, obsFt); e != nil {
+		if e := sea.AddFitted(basePipe, rootDir+"model", modl.FieldColumns[ind], modl.FieldNames[ind], fts, false, obsFt); e != nil {
 			return e
 		}
 	}
